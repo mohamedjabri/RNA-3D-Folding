@@ -1,0 +1,14 @@
+numpy
+scipy
+pandas
+torch
+torchvision
+torchaudio
+tqdm
+einops
+transformers
+biopython
+matplotlib
+seaborn
+plotly
+kaggle
