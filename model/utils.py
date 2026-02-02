@@ -1,26 +1,27 @@
 import torch
 import torch.nn as nn
 
-def pairwise_distance_loss(pred, target, mask):
-    # pred, target: (L, 3)
-    # mask: (L,)
-    valid = mask > 0
-    P = pred[valid]
-    Q = target[valid]
+def local_pairwise_distance_loss(P, Q, k=4):
+    """
+    Only enforce distances to k nearest neighbors along the chain
+    """
+    L = P.shape[0]
 
-    if P.shape[0] < 3:
-        return torch.tensor(0.0, device=pred.device)
+    if L < k + 1:
+        return P.new_tensor(0.0)
 
-    Dp = torch.cdist(P, P)
-    Dq = torch.cdist(Q, Q)
+    loss = 0.0
+    count = 0
 
-    max_d = 20.0
-    Dp = torch.clamp(Dp, max=max_d)
-    Dq = torch.clamp(Dq, max=max_d)
+    for i in range(L):
+        j_max = min(L, i + k + 1)
+        Dp = torch.norm(P[i] - P[i+1:j_max], dim=-1)
+        Dq = torch.norm(Q[i] - Q[i+1:j_max], dim=-1)
 
-    loss = torch.mean((Dp - Dq) ** 2)
+        loss += torch.mean(torch.log1p(torch.abs(Dp - Dq)))
+        count += 1
 
-    return loss
+    return loss / count
 
 
 def kabsch_align(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
@@ -50,71 +51,111 @@ def kabsch_align(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
     P_aligned = p @ R + centroid_Q
     return P_aligned
 
-def center_coords(coords, mask):
+def center_preds_multi(preds, mask, eps=1e-8):
     """
-    coords: (B, L, 3)
+    coords: (B, K, L, 3)
     mask:   (B, L)
     """
-    mask_f = mask.unsqueeze(-1)
+    B, K, L, _ = preds.shape
 
-    centroid = (coords * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(dim=1, keepdim=True)
+    # (B, 1, L, 1)
+    mask_f = mask[:, None, :, None].float()
+
+    denom = mask_f.sum(dim=2, keepdim=True).clamp_min(eps)
+
+    centroid = (preds * mask_f).sum(dim=2, keepdim=True) / denom
+
+    return preds - centroid
+
+def center_coords_multi(coords, mask, eps=1e-8):
+    """
+    coords: (B, K, L, 3)
+    mask:   (B, L)
+    """
+    B, L, _ = coords.shape
+
+    # (B, 1, L, 1)
+    mask_f = mask[:, None, :, None].float()
+
+    denom = mask_f.sum(dim=2, keepdim=True).clamp_min(eps)
+
+    centroid = (coords * mask_f).sum(dim=2, keepdim=True) / denom
+
     return coords - centroid
 
-def combined_loss(pred, target, mask,
-                  Z=None,
-                  w_kabsch=1.0,
-                  w_dist=0.1,
-                  w_aux=0.05,
-                  w_smooth=0.01):
+def combined_loss_multi(
+    pred, target, mask, Z=None,
+    w_kabsch=1.0,
+    w_dist=0.1,
+    w_aux=0.05,
+    w_smooth=0.01,
+    clamp=100.0
+):
     """
-    pred, target: (B, L, 3)
-    mask: (B, L)
-    Z: (B, L, d_aux) or None
+    pred   : (B, K, L, 3)
+    target : (B, T, L, 3)
+    mask   : (B, L)
+    Z      : (B, K, L, d_aux) or None
     """
-    loss = 0.0
-    B = pred.shape[0]
+    B, K, L, _ = pred.shape
+    T = target.shape[1]
+
+    total_loss = 0.0
 
     for b in range(B):
         valid = mask[b] > 0
 
-        P = pred[b, valid]     # (L', 3)
-        Q = target[b, valid]   # (L', 3)
-
-        if P.shape[0] < 3:
+        if valid.sum() < 3:
             continue
 
-        # --- 1. Kabsch-aligned MSE ---
-        P_aligned = kabsch_align(P, Q)
-        loss_kabsch = torch.mean((P_aligned - Q) ** 2)
+        for k in range(K):
+            P = pred[b, k, valid]
+            P = torch.clamp(P, -clamp, clamp)
 
-        # --- 2. Pairwise distance loss ---
-        loss_pair = pairwise_distance_loss(
-            P,
-            Q,
-            torch.ones(len(P), device=P.device)
-        )
+            # ---- best GT match ----
+            best_kabsch = None
+            best_dist   = None
 
-        # --- 3. Delta smoothness loss ---
-        d1 = P[1:] - P[:-1]
-        d2 = d1[1:] - d1[:-1]
-        loss_smooth = torch.mean(torch.abs(d2).sum(dim=-1))
+            for t in range(T):
+                Q = target[b, t, valid]
+                Q = torch.clamp(Q, -clamp, clamp)
 
-        total = (
-            w_kabsch * loss_kabsch
-            + w_dist * loss_pair
-            + w_smooth * loss_smooth
-        )
+                # center
+                Pc = center_coords_multi(P, valid)
+                Qc = center_coords_multi(Q, valid)
 
-        # --- 4. Auxiliary distance loss ---
-        if Z is not None:
-            Zb = Z[b, valid]
+                # Kabsch
+                P_aligned = kabsch_align(Pc, Qc)
+                loss_k = torch.mean((P_aligned - Qc) ** 2)
 
-            D_pred = torch.cdist(Zb, Zb)
-            D_true = torch.cdist(Q, Q)
+                # Pairwise distances
+                Dp = torch.cdist(P, P)
+                Dq = torch.cdist(Q, Q)
+                loss_d = local_pairwise_distance_loss(Dp, Dq)
 
-            loss_aux = torch.mean(torch.abs(D_pred - D_true))
-            total = total + w_aux * loss_aux
+                if best_kabsch is None or loss_k < best_kabsch:
+                    best_kabsch = loss_k
+                    best_dist   = loss_d
 
-        loss += total
+            # ---- smoothness ----
+            d1 = P[1:] - P[:-1]
+            d2 = d1[1:] - d1[:-1]
+            loss_smooth = torch.mean(torch.norm(d2, dim=-1))
 
-    return loss / B
+            loss_k_total = (
+                w_kabsch * best_kabsch
+                + w_dist   * best_dist
+                + w_smooth * loss_smooth
+            )
+
+            # ---- auxiliary latent distance ----
+            if Z is not None:
+                Zk = Z[b, k, valid]
+                Dz = torch.cdist(Zk, Zk)
+                Dq = torch.cdist(Q, Q)
+                loss_aux = torch.mean(torch.abs(Dz - Dq))
+                loss_k_total = loss_k_total + w_aux * loss_aux
+
+            total_loss += loss_k_total
+
+    return total_loss / (B * K)

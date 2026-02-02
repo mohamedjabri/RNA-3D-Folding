@@ -157,49 +157,51 @@ def build_transformer_encoder(d_model, num_layers=7, num_heads=8):
     ])
 
 class RNATransformer(nn.Module):
-    def __init__(self, vocab_size=VOCAB_SIZE, d_model=D_MODEL):
+    def __init__(self, vocab_size=VOCAB_SIZE, d_model=D_MODEL, K=5):
         super().__init__()
+        self.K = K
 
-        # Token embedding
         self.embedding = nn.Embedding(
-            vocab_size,
-            d_model,
-            padding_idx=PAD_IDX
+            vocab_size, d_model, padding_idx=PAD_IDX
         )
 
-        # Positional encoding
         self.pos_encoding = SinusoidalPositionalEncoding(d_model)
-
-        # Transformer encoder
         self.encoder = build_transformer_encoder(d_model)
 
-        # Delta coordinate head
-        self.delta_head = nn.Linear(d_model, 3)
+        # Predict deltas for K structures
+        self.delta_head = nn.Linear(d_model, 3 * K)
 
-        # auxiliary distance head
+        # Auxiliary embedding (shared across K)
         self.dist_proj = nn.Linear(d_model, 32)
 
     def forward(self, tokens, mask=None):
         """
         tokens: (B, L)
-        returns: (B, L, 3)
+        returns:
+          coords: (B, K, L, 3)
+          Z:      (B, L, 32)
         """
-        x = self.embedding(tokens)      # (B, L, D)
-        x = self.pos_encoding(x)        # (B, L, D)
+        B, L = tokens.shape
+
+        x = self.embedding(tokens)
+        x = self.pos_encoding(x)
+
         for layer in self.encoder:
             x = layer(x, mask)
-            
-        # Predict deltas
-        delta = self.delta_head(x)      # (B, L, 3)
 
-        # Mask padding deltas
+        # (B, L, 3K)
+        delta = self.delta_head(x)
+
+        # reshape → (B, L, K, 3) → (B, K, L, 3)
+        delta = delta.view(B, L, self.K, 3).permute(0, 2, 1, 3)
+
         if mask is not None:
-            delta = delta * mask.unsqueeze(-1)
+            delta = delta * mask[:, None, :, None]
 
-        # Reconstruct coordinates via cumulative sum
-        coords = torch.cumsum(delta, dim=1)  # (B, L, 3)
-        
-        Z = self.dist_proj(x)               # (B, L, 32)
-    
+        # cumulative sum per structure
+        coords = torch.cumsum(delta, dim=2)
+
+        Z = self.dist_proj(x)
+
         return coords, Z
 
